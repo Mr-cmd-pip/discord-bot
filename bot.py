@@ -1,50 +1,84 @@
 """
-Discord Utility Bot
-===================
+Discord Utility Bot  (with Voice / Music Support)
+==================================================
 A feature-complete Discord bot with general commands, moderation tools,
-and an automatic welcome system.
+automatic welcome system, and a full music player.
 
 Requirements:
-    pip install discord.py python-dotenv
+    pip install "discord.py[voice]" python-dotenv yt-dlp PyNaCl
 
 Setup:
     1. Create a .env file in the same directory with:
        DISCORD_TOKEN=your_bot_token_here
        WELCOME_CHANNEL_ID=channel_id_for_welcome_messages (optional)
        WELCOME_MESSAGE=👋 Welcome {username} to {server}! (optional)
-    2. Enable the following Privileged Gateway Intents in the Discord Developer Portal:
+    2. Enable Privileged Gateway Intents in the Discord Developer Portal:
        - SERVER MEMBERS INTENT
        - MESSAGE CONTENT INTENT
-    3. Run with: python bot.py
+       - PRESENCE INTENT
+    3. Install FFmpeg:
+       macOS:   brew install ffmpeg
+       Ubuntu:  sudo apt install ffmpeg
+       Windows: https://ffmpeg.org/download.html
+    4. Run with: python bot.py
 """
 
 import discord
 from discord.ext import commands
 import os
+import asyncio
+from collections import deque
 from datetime import timezone
 from dotenv import load_dotenv
+import yt_dlp
 
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", 0))  # 0 = disabled
-WELCOME_MESSAGE = os.getenv(
-    "WELCOME_MESSAGE",
-    "👋 Welcome {username} to {server}!"
-)
+TOKEN              = os.getenv("DISCORD_TOKEN")
+WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", 0))
+WELCOME_MESSAGE    = os.getenv("WELCOME_MESSAGE", "👋 Welcome {username} to {server}!")
+
+# yt-dlp options — extract audio, best quality, support plain search queries
+YDL_OPTIONS = {
+    "format":         "bestaudio/best",
+    "noplaylist":     True,
+    "quiet":          True,
+    "default_search": "ytsearch",   # allows !play <search terms> without a URL
+    "source_address": "0.0.0.0",
+}
+
+# FFmpeg options — reconnect on network hiccups
+FFMPEG_OPTIONS = {
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options":        "-vn",
+}
 
 # ─────────────────────────────────────────────
 # Intents & Bot Setup
 # ─────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.members = True          # Required for on_member_join & member count
-intents.message_content = True  # Required to read message content (privileged)
-intents.presences = True        # Required for online member count
+intents                 = discord.Intents.default()
+intents.members         = True
+intents.message_content = True
+intents.presences       = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# ─────────────────────────────────────────────
+# Per-Guild Music State
+# ─────────────────────────────────────────────
+music_queues: dict = {}   # guild_id -> deque of track dicts
+now_playing:  dict = {}   # guild_id -> current track dict
+
+
+def get_queue(guild_id: int) -> deque:
+    """Return (creating if needed) the music queue for a guild."""
+    if guild_id not in music_queues:
+        music_queues[guild_id] = deque()
+    return music_queues[guild_id]
+
 
 # ─────────────────────────────────────────────
 # Helper: Permission Check
@@ -53,6 +87,79 @@ def is_moderator(ctx: commands.Context) -> bool:
     """Returns True if the invoking member has Administrator or Manage Messages permission."""
     perms = ctx.author.guild_permissions
     return perms.administrator or perms.manage_messages
+
+
+# ─────────────────────────────────────────────
+# Helper: Resolve a YouTube URL or search query
+# ─────────────────────────────────────────────
+async def resolve_track(query: str):
+    """
+    Uses yt-dlp in a thread pool to fetch track metadata without blocking the event loop.
+    Returns a dict: { title, url (stream URL), webpage_url, duration }
+    or None on failure.
+    """
+    loop = asyncio.get_event_loop()
+
+    def _extract():
+        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+            info = ydl.extract_info(query, download=False)
+            if "entries" in info:          # search result or playlist
+                info = info["entries"][0]
+            return {
+                "title":       info.get("title", "Unknown"),
+                "url":         info["url"],
+                "webpage_url": info.get("webpage_url", query),
+                "duration":    info.get("duration", 0),
+            }
+
+    try:
+        return await loop.run_in_executor(None, _extract)
+    except Exception as e:
+        print(f"yt-dlp error: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+# Core: Advance to the next queued track
+# ─────────────────────────────────────────────
+async def advance_queue(ctx: commands.Context):
+    """
+    Called after a track finishes. Pulls the next track from the queue,
+    announces it, and starts playback. Stops gracefully if queue is empty.
+    """
+    guild_id = ctx.guild.id
+    queue    = get_queue(guild_id)
+
+    if not queue:
+        now_playing.pop(guild_id, None)
+        return
+
+    track = queue.popleft()
+    now_playing[guild_id] = track
+
+    # Announce
+    embed = discord.Embed(
+        title="🎵 Now Playing",
+        description=f"[{track['title']}]({track['webpage_url']})",
+        color=discord.Color.green()
+    )
+    duration = track.get("duration", 0)
+    if duration:
+        mins, secs = divmod(duration, 60)
+        embed.add_field(name="⏱️ Duration", value=f"{mins}:{secs:02d}")
+    await ctx.send(embed=embed)
+
+    # Play
+    source = discord.FFmpegPCMAudio(track["url"], **FFMPEG_OPTIONS)
+    source = discord.PCMVolumeTransformer(source, volume=0.5)
+
+    def after_play(error):
+        if error:
+            print(f"Player error: {error}")
+        asyncio.run_coroutine_threadsafe(advance_queue(ctx), bot.loop)
+
+    if ctx.voice_client and ctx.voice_client.is_connected():
+        ctx.voice_client.play(source, after=after_play)
 
 
 # ═════════════════════════════════════════════
@@ -69,25 +176,13 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    """
-    Welcome System
-    ──────────────
-    Fires when a new member joins the server.
-    Sends a configurable welcome message to WELCOME_CHANNEL_ID.
-    If no channel is configured the event is silently ignored.
-    """
+    """Send a configurable welcome message when a new member joins."""
     if not WELCOME_CHANNEL_ID:
-        return  # Welcome system disabled
-
+        return
     channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
     if channel is None:
-        print(f"⚠️  Welcome channel {WELCOME_CHANNEL_ID} not found in {member.guild.name}")
         return
-
-    message = WELCOME_MESSAGE.format(
-        username=member.mention,
-        server=member.guild.name
-    )
+    message = WELCOME_MESSAGE.format(username=member.mention, server=member.guild.name)
     await channel.send(message)
 
 
@@ -97,28 +192,19 @@ async def on_member_join(member: discord.Member):
 
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
-    """
-    !ping
-    ─────
-    Measures the bot's WebSocket latency and responds with the result.
-    """
+    """!ping — Check bot latency."""
     latency_ms = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! `{latency_ms}ms`")
 
 
 @bot.command(name="help")
 async def help_command(ctx: commands.Context):
-    """
-    !help
-    ─────
-    Displays all available commands grouped by category using a Discord Embed.
-    """
+    """!help — Show all commands grouped by category."""
     embed = discord.Embed(
         title="📖 Bot Commands",
         description="Here's everything I can do:",
         color=discord.Color.blurple()
     )
-
     embed.add_field(
         name="🔷 General",
         value=(
@@ -129,7 +215,6 @@ async def help_command(ctx: commands.Context):
         ),
         inline=False
     )
-
     embed.add_field(
         name="🛡️ Moderation *(Admin / Manage Messages)*",
         value=(
@@ -138,77 +223,64 @@ async def help_command(ctx: commands.Context):
         ),
         inline=False
     )
-
+    embed.add_field(
+        name="🎵 Music",
+        value=(
+            "`!join`  — Join your voice channel\n"
+            "`!play <url or search>`  — Play or queue a track\n"
+            "`!pause`  — Pause playback\n"
+            "`!resume`  — Resume playback\n"
+            "`!skip`  — Skip the current track\n"
+            "`!queue`  — Show the track queue\n"
+            "`!nowplaying` / `!np`  — Show the current track\n"
+            "`!volume <0-100>`  — Adjust volume\n"
+            "`!stop`  — Stop and clear the queue\n"
+            "`!leave`  — Disconnect from voice"
+        ),
+        inline=False
+    )
     embed.add_field(
         name="👋 Automatic Welcome",
         value="Sends a welcome message whenever a new member joins.",
         inline=False
     )
-
     embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
     await ctx.send(embed=embed)
 
 
 @bot.command(name="info")
 async def server_info(ctx: commands.Context):
-    """
-    !info
-    ─────
-    Displays detailed statistics about the current server using an Embed.
-    """
-    guild = ctx.guild
-
-    # Count online members (requires presences intent)
+    """!info — Display server statistics."""
+    guild        = ctx.guild
     online_count = sum(
         1 for m in guild.members
         if m.status != discord.Status.offline and not m.bot
     )
-
-    # Format creation date
     created_at = guild.created_at.astimezone(timezone.utc).strftime("%B %d, %Y")
 
-    embed = discord.Embed(
-        title=f"📊 {guild.name}",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title=f"📊 {guild.name}", color=discord.Color.green())
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-
-    embed.add_field(name="👑 Owner",         value=guild.owner.mention,         inline=True)
-    embed.add_field(name="👥 Total Members", value=str(guild.member_count),      inline=True)
-    embed.add_field(name="🟢 Online",        value=str(online_count),            inline=True)
-    embed.add_field(name="📅 Created",       value=created_at,                   inline=True)
-    embed.add_field(name="💬 Channels",      value=str(len(guild.channels)),     inline=True)
-    embed.add_field(name="🏷️ Roles",         value=str(len(guild.roles) - 1),    inline=True)  # -1 to exclude @everyone
-
+    embed.add_field(name="👑 Owner",         value=guild.owner.mention,      inline=True)
+    embed.add_field(name="👥 Total Members", value=str(guild.member_count),  inline=True)
+    embed.add_field(name="🟢 Online",        value=str(online_count),        inline=True)
+    embed.add_field(name="📅 Created",       value=created_at,               inline=True)
+    embed.add_field(name="💬 Channels",      value=str(len(guild.channels)), inline=True)
+    embed.add_field(name="🏷️ Roles",         value=str(len(guild.roles)-1),  inline=True)
     embed.set_footer(text=f"Server ID: {guild.id}")
     await ctx.send(embed=embed)
 
 
 @bot.command(name="userinfo")
 async def user_info(ctx: commands.Context, member: discord.Member = None):
-    """
-    !userinfo [@user]
-    ─────────────────
-    Displays profile information for the mentioned user.
-    Defaults to the command author if no user is mentioned.
-
-    Parameter
-    ---------
-    member : discord.Member, optional
-        The member to look up. Defaults to ctx.author.
-    """
-    member = member or ctx.author  # Default to command invoker
-
-    # Format dates
+    """!userinfo [@user] — Show profile info for a user."""
+    member     = member or ctx.author
     created_at = member.created_at.astimezone(timezone.utc).strftime("%B %d, %Y")
-    joined_at = (
+    joined_at  = (
         member.joined_at.astimezone(timezone.utc).strftime("%B %d, %Y")
         if member.joined_at else "Unknown"
     )
-
-    # Build roles list (exclude @everyone)
-    roles = [r.mention for r in reversed(member.roles) if r.name != "@everyone"]
+    roles         = [r.mention for r in reversed(member.roles) if r.name != "@everyone"]
     roles_display = ", ".join(roles) if roles else "None"
 
     embed = discord.Embed(
@@ -216,13 +288,11 @@ async def user_info(ctx: commands.Context, member: discord.Member = None):
         color=member.color if member.color != discord.Color.default() else discord.Color.blurple()
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-
-    embed.add_field(name="🆔 User ID",          value=str(member.id),    inline=True)
-    embed.add_field(name="🤖 Bot?",             value=str(member.bot),   inline=True)
-    embed.add_field(name="📅 Account Created",  value=created_at,        inline=False)
-    embed.add_field(name="📥 Joined Server",    value=joined_at,         inline=False)
-    embed.add_field(name=f"🏷️ Roles ({len(roles)})", value=roles_display, inline=False)
-
+    embed.add_field(name="🆔 User ID",                value=str(member.id),  inline=True)
+    embed.add_field(name="🤖 Bot?",                   value=str(member.bot), inline=True)
+    embed.add_field(name="📅 Account Created",         value=created_at,      inline=False)
+    embed.add_field(name="📥 Joined Server",           value=joined_at,       inline=False)
+    embed.add_field(name=f"🏷️ Roles ({len(roles)})",  value=roles_display,   inline=False)
     embed.set_footer(text=f"Requested by {ctx.author}")
     await ctx.send(embed=embed)
 
@@ -233,71 +303,37 @@ async def user_info(ctx: commands.Context, member: discord.Member = None):
 
 @bot.command(name="clear")
 async def clear_messages(ctx: commands.Context, amount: int = None):
-    """
-    !clear <number>
-    ───────────────
-    Bulk-deletes a specified number of messages from the current channel.
-    Capped at 100 messages per invocation to prevent abuse.
-
-    Permission required: Administrator OR Manage Messages
-    """
-    # ── Permission check ──
+    """!clear <number> — Bulk-delete messages. Requires Manage Messages."""
     if not is_moderator(ctx):
-        await ctx.send(
-            "❌ You need **Administrator** or **Manage Messages** permission to use this command.",
-            delete_after=8
-        )
+        await ctx.send("❌ You need **Administrator** or **Manage Messages** permission.", delete_after=8)
         return
-
-    # ── Argument validation ──
     if amount is None:
-        await ctx.send("⚠️ Please specify how many messages to delete. e.g. `!clear 10`", delete_after=8)
+        await ctx.send("⚠️ Usage: `!clear <number>`", delete_after=8)
         return
-
     if not (1 <= amount <= 100):
-        await ctx.send("⚠️ Please provide a number between **1** and **100**.", delete_after=8)
+        await ctx.send("⚠️ Number must be between **1** and **100**.", delete_after=8)
         return
-
-    # ── Deletion (include the command message itself: amount + 1) ──
-    deleted = await ctx.channel.purge(limit=amount + 1)
-
-    confirmation = await ctx.send(
-        f"✅ Deleted **{len(deleted) - 1}** message(s)."
-    )
-    # Auto-remove confirmation after 5 seconds
+    deleted      = await ctx.channel.purge(limit=amount + 1)
+    confirmation = await ctx.send(f"✅ Deleted **{len(deleted) - 1}** message(s).")
     await confirmation.delete(delay=5)
 
 
 @bot.command(name="say")
 async def say(ctx: commands.Context, *, text: str = None):
-    """
-    !say <text>
-    ───────────
-    Makes the bot echo the provided text, then deletes the original command message.
-
-    Permission required: Administrator OR Manage Messages
-    """
-    # ── Permission check ──
+    """!say <text> — Make the bot repeat text. Requires Manage Messages."""
     if not is_moderator(ctx):
-        await ctx.send(
-            "❌ You need **Administrator** or **Manage Messages** permission to use this command.",
-            delete_after=8
-        )
+        await ctx.send("❌ You need **Administrator** or **Manage Messages** permission.", delete_after=8)
         return
-
-    # ── Argument check ──
     if not text:
-        await ctx.send("⚠️ Please provide some text. e.g. `!say Hello world!`", delete_after=8)
+        await ctx.send("⚠️ Usage: `!say <text>`", delete_after=8)
         return
-
-    # ── Delete invoker's message, then speak ──
     try:
         await ctx.message.delete()
     except discord.Forbidden:
-        pass  # Can't delete — carry on anyway
-
+        pass
     await ctx.send(text)
-    
+
+
 # ═════════════════════════════════════════════
 # MUSIC COMMANDS
 # ═════════════════════════════════════════════
@@ -499,7 +535,7 @@ async def stop(ctx: commands.Context):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
     await ctx.send("⏹️ Stopped playback and cleared the queue.")
-    
+
 
 # ═════════════════════════════════════════════
 # ERROR HANDLING
@@ -507,27 +543,18 @@ async def stop(ctx: commands.Context):
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
-    """
-    Global error handler — catches common errors and responds with
-    a friendly message instead of letting the bot silently fail.
-    """
+    """Global error handler — responds with friendly messages."""
     if isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Member not found. Please mention a valid user.", delete_after=8)
-
     elif isinstance(error, commands.BadArgument):
         await ctx.send(f"❌ Invalid argument: `{error}`", delete_after=8)
-
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"❌ Missing required argument: `{error.param.name}`", delete_after=8)
-
     elif isinstance(error, commands.CommandNotFound):
-        pass  # Silently ignore unknown commands
-
+        pass   # silently ignore unknown commands
     elif isinstance(error, discord.Forbidden):
         await ctx.send("❌ I don't have permission to do that.", delete_after=8)
-
     else:
-        # Re-raise unexpected errors so they show up in console logs
         print(f"Unhandled error in command '{ctx.command}': {error}")
         raise error
 
