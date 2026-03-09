@@ -297,7 +297,209 @@ async def say(ctx: commands.Context, *, text: str = None):
         pass  # Can't delete — carry on anyway
 
     await ctx.send(text)
+    
+# ═════════════════════════════════════════════
+# MUSIC COMMANDS
+# ═════════════════════════════════════════════
 
+@bot.command(name="join")
+async def join(ctx: commands.Context):
+    """!join — Bot joins your current voice channel."""
+    if not ctx.author.voice:
+        await ctx.send("❌ You must be in a voice channel first!", delete_after=8)
+        return
+    channel = ctx.author.voice.channel
+    if ctx.voice_client:
+        await ctx.voice_client.move_to(channel)
+    else:
+        await channel.connect()
+    await ctx.send(f"✅ Joined **{channel.name}**")
+
+
+@bot.command(name="leave")
+async def leave(ctx: commands.Context):
+    """!leave — Disconnect from voice and clear the queue."""
+    if not ctx.voice_client:
+        await ctx.send("❌ I'm not in a voice channel.", delete_after=8)
+        return
+    guild_id = ctx.guild.id
+    get_queue(guild_id).clear()
+    now_playing.pop(guild_id, None)
+    await ctx.voice_client.disconnect()
+    await ctx.send("👋 Disconnected from voice channel.")
+
+
+@bot.command(name="play")
+async def play(ctx: commands.Context, *, query: str = None):
+    """
+    !play <YouTube URL or search terms>
+    ────────────────────────────────────
+    Plays immediately if idle, otherwise adds to the queue.
+    Accepts full YouTube URLs or plain search text.
+    """
+    if not query:
+        await ctx.send("⚠️ Usage: `!play <url or search terms>`", delete_after=8)
+        return
+
+    # Auto-join if needed
+    if not ctx.voice_client:
+        if not ctx.author.voice:
+            await ctx.send("❌ Join a voice channel first!", delete_after=8)
+            return
+        await ctx.author.voice.channel.connect()
+
+    loading_msg = await ctx.send("🔍 Searching...")
+    track       = await resolve_track(query)
+
+    if not track:
+        await loading_msg.edit(content="❌ Could not find that track. Try a different search.")
+        return
+
+    await loading_msg.delete()
+
+    guild_id = ctx.guild.id
+    queue    = get_queue(guild_id)
+
+    if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+        # ── Add to queue ──
+        queue.append(track)
+        embed = discord.Embed(
+            title="➕ Added to Queue",
+            description=f"[{track['title']}]({track['webpage_url']})",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="📋 Position in Queue", value=str(len(queue)))
+        await ctx.send(embed=embed)
+    else:
+        # ── Play immediately ──
+        now_playing[guild_id] = track
+        source = discord.FFmpegPCMAudio(track["url"], **FFMPEG_OPTIONS)
+        source = discord.PCMVolumeTransformer(source, volume=0.5)
+
+        def after_play(error):
+            if error:
+                print(f"Player error: {error}")
+            asyncio.run_coroutine_threadsafe(advance_queue(ctx), bot.loop)
+
+        ctx.voice_client.play(source, after=after_play)
+
+        embed = discord.Embed(
+            title="🎵 Now Playing",
+            description=f"[{track['title']}]({track['webpage_url']})",
+            color=discord.Color.green()
+        )
+        duration = track.get("duration", 0)
+        if duration:
+            mins, secs = divmod(duration, 60)
+            embed.add_field(name="⏱️ Duration", value=f"{mins}:{secs:02d}")
+        await ctx.send(embed=embed)
+
+
+@bot.command(name="pause")
+async def pause(ctx: commands.Context):
+    """!pause — Pause the current track."""
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.pause()
+        await ctx.send("⏸️ Paused.")
+    else:
+        await ctx.send("❌ Nothing is playing right now.", delete_after=8)
+
+
+@bot.command(name="resume")
+async def resume(ctx: commands.Context):
+    """!resume — Resume a paused track."""
+    if ctx.voice_client and ctx.voice_client.is_paused():
+        ctx.voice_client.resume()
+        await ctx.send("▶️ Resumed.")
+    else:
+        await ctx.send("❌ Nothing is paused right now.", delete_after=8)
+
+
+@bot.command(name="skip")
+async def skip(ctx: commands.Context):
+    """!skip — Skip the current track."""
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        await ctx.send("❌ Nothing is playing right now.", delete_after=8)
+        return
+    ctx.voice_client.stop()   # triggers after_play → advance_queue
+    await ctx.send("⏭️ Skipped.")
+
+
+@bot.command(name="queue")
+async def show_queue(ctx: commands.Context):
+    """!queue — Show the music queue."""
+    guild_id = ctx.guild.id
+    queue    = get_queue(guild_id)
+    current  = now_playing.get(guild_id)
+
+    embed = discord.Embed(title="🎶 Music Queue", color=discord.Color.purple())
+
+    embed.add_field(
+        name="🎵 Now Playing",
+        value=(
+            f"[{current['title']}]({current['webpage_url']})"
+            if current else "Nothing"
+        ),
+        inline=False
+    )
+
+    if queue:
+        queue_list = "\n".join(
+            f"`{i+1}.` [{t['title']}]({t['webpage_url']})"
+            for i, t in enumerate(queue)
+        )
+        embed.add_field(name=f"📋 Up Next ({len(queue)} tracks)", value=queue_list, inline=False)
+    else:
+        embed.add_field(name="📋 Up Next", value="Queue is empty", inline=False)
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="nowplaying", aliases=["np"])
+async def now_playing_cmd(ctx: commands.Context):
+    """!nowplaying (or !np) — Show the current track."""
+    track = now_playing.get(ctx.guild.id)
+    if not track:
+        await ctx.send("❌ Nothing is playing right now.", delete_after=8)
+        return
+    embed = discord.Embed(
+        title="🎵 Now Playing",
+        description=f"[{track['title']}]({track['webpage_url']})",
+        color=discord.Color.green()
+    )
+    duration = track.get("duration", 0)
+    if duration:
+        mins, secs = divmod(duration, 60)
+        embed.add_field(name="⏱️ Duration", value=f"{mins}:{secs:02d}")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="volume", aliases=["vol"])
+async def volume(ctx: commands.Context, level: int = None):
+    """!volume <0-100> — Adjust playback volume."""
+    if level is None:
+        await ctx.send("⚠️ Usage: `!volume <0-100>`", delete_after=8)
+        return
+    if not (0 <= level <= 100):
+        await ctx.send("⚠️ Volume must be between **0** and **100**.", delete_after=8)
+        return
+    if ctx.voice_client and ctx.voice_client.source:
+        ctx.voice_client.source.volume = level / 100
+        await ctx.send(f"🔊 Volume set to **{level}%**")
+    else:
+        await ctx.send("❌ Nothing is playing right now.", delete_after=8)
+
+
+@bot.command(name="stop")
+async def stop(ctx: commands.Context):
+    """!stop — Stop playback and clear the queue."""
+    guild_id = ctx.guild.id
+    get_queue(guild_id).clear()
+    now_playing.pop(guild_id, None)
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+    await ctx.send("⏹️ Stopped playback and cleared the queue.")
+    
 
 # ═════════════════════════════════════════════
 # ERROR HANDLING
