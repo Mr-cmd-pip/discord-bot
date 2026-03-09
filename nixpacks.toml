@@ -1,0 +1,5 @@
+[phases.install]
+cmds = ["pip install 'discord.py[voice]>=2.3.0' python-dotenv yt-dlp PyNaCl"]
+
+[start]
+cmd = "python bot.py"
