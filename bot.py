@@ -24,7 +24,7 @@ Setup:
 """
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks   # <-- tasks added
 import os
 import asyncio
 from collections import deque
@@ -163,12 +163,29 @@ async def advance_queue(ctx: commands.Context):
 
 
 # ═════════════════════════════════════════════
+# VOICE KEEP-ALIVE
+# ═════════════════════════════════════════════
+
+@tasks.loop(seconds=20)
+async def voice_keep_alive():
+    """Sends a silent ping every 20s to prevent Discord dropping idle voice connections."""
+    for vc in bot.voice_clients:
+        if vc.is_connected():
+            await vc.guild.change_voice_state(channel=vc.channel, self_mute=False, self_deaf=True)
+
+@voice_keep_alive.before_loop
+async def before_voice_keep_alive():
+    await bot.wait_until_ready()
+
+
+# ═════════════════════════════════════════════
 # EVENTS
 # ═════════════════════════════════════════════
 
 @bot.event
 async def on_ready():
     """Fired when the bot successfully connects to Discord."""
+    voice_keep_alive.start()   # <-- start keep-alive
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"   Connected to {len(bot.guilds)} guild(s)")
     await bot.change_presence(activity=discord.Game(name="!help for commands"))
@@ -349,8 +366,7 @@ async def join(ctx: commands.Context):
         await ctx.voice_client.move_to(channel)
     else:
         await channel.connect()
-    # When connecting to a voice channel
-    await ctx.guild.change_voice_state(channel=channel, self_mute=False, self_deaf=True) 
+    await ctx.guild.change_voice_state(channel=channel, self_mute=False, self_deaf=True)
     await ctx.send(f"✅ Joined **{channel.name}**")
 
 
@@ -385,6 +401,7 @@ async def play(ctx: commands.Context, *, query: str = None):
             await ctx.send("❌ Join a voice channel first!", delete_after=8)
             return
         await ctx.author.voice.channel.connect()
+        await ctx.guild.change_voice_state(channel=ctx.author.voice.channel, self_mute=False, self_deaf=True)
 
     loading_msg = await ctx.send("🔍 Searching...")
     track       = await resolve_track(query)
