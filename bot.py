@@ -184,7 +184,7 @@ async def on_member_join(member: discord.Member):
         return
     message = WELCOME_MESSAGE.format(username=member.mention, server=member.guild.name)
     await channel.send(message)
-
+    
 
 # ═════════════════════════════════════════════
 # GENERAL COMMANDS
@@ -349,6 +349,8 @@ async def join(ctx: commands.Context):
         await ctx.voice_client.move_to(channel)
     else:
         await channel.connect()
+    # When connecting to a voice channel
+    await ctx.guild.change_voice_state(channel=channel, self_mute=False, self_deaf=True) 
     await ctx.send(f"✅ Joined **{channel.name}**")
 
 
