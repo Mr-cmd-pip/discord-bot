@@ -12,7 +12,7 @@ Key improvements over original:
   - Proper cleanup on cog unload (bot restart safety)
   - Guard against double-play when voice_client reconnects
   - 24/7 rejoin only when mode is actually active
-  - All voice-state edge cases handled (kicked, moved, etc.)
+  - All voice-state edge cases handled (kicked, moved, empty channel, etc.)
 """
 
 from __future__ import annotations
@@ -51,6 +51,7 @@ FFMPEG_OPTIONS: dict = {
 }
 
 DEFAULT_VOLUME: float = 0.5  # 50 %
+AUTO_LEAVE_GRACE: int = 30   # seconds to wait before leaving an empty channel
 
 
 # ─────────────────────────────────────────────────────────────
@@ -225,21 +226,6 @@ class Music(commands.Cog):
 
         source = self._make_source(track, volume=current_vol)
 
-        def after_play(error: Optional[Exception]) -> None:
-            if error:
-                log.error("FFmpeg player error: %s", error)
-            # Schedule the next track safely from the non-async callback
-            player = self._player(ctx.guild.id)
-            player._advance_task = asyncio.run_coroutine_threadsafe(
-                self.advance_queue(ctx), self.bot.loop
-            ).result  # returns the Future; we ignore the result here
-            # Re-assign properly so we can cancel it
-            player._advance_task = self.bot.loop.create_task(
-                self.advance_queue(ctx)
-            )
-
-        # after_play schedules advance_queue; we do it via create_task
-        # inside run_coroutine_threadsafe for thread-safety.
         def _schedule_advance(error: Optional[Exception]) -> None:
             if error:
                 log.error("FFmpeg player error: %s", error)
@@ -307,7 +293,8 @@ class Music(commands.Cog):
         Handles three cases:
           1. Bot was force-kicked from a channel → rejoin if 24/7 is on.
           2. Bot was *moved* to a different channel → update state, no rejoin needed.
-          3. All humans left the channel → optionally disconnect if not 24/7.
+          3. All humans left the channel → auto-disconnect after a grace
+             period, unless 24/7 mode is active.
         """
         guild = before.channel.guild if before.channel else (after.channel.guild if after.channel else None)
         if guild is None:
@@ -350,7 +337,7 @@ class Music(commands.Cog):
         # Count non-bot members still in the channel
         human_count = sum(1 for m in before.channel.members if not m.bot)
         if human_count == 0 and not player.twentyfourseven:
-            await asyncio.sleep(30)  # grace period before auto-leaving
+            await asyncio.sleep(AUTO_LEAVE_GRACE)  # grace period before auto-leaving
             # Re-check after the wait (someone may have rejoined)
             human_count = sum(1 for m in before.channel.members if not m.bot)
             if human_count == 0 and vc.is_connected():
@@ -369,6 +356,7 @@ class Music(commands.Cog):
             return await ctx.send("❌ You must be in a voice channel first!", delete_after=8)
 
         channel = ctx.author.voice.channel
+
         if ctx.voice_client:
             await ctx.voice_client.move_to(channel)
         else:
@@ -397,8 +385,7 @@ class Music(commands.Cog):
         if not ctx.author.voice:
             return await ctx.send("❌ You must be in a voice channel first!", delete_after=8)
 
-        player   = self._player(ctx.guild.id)
-        guild_id = ctx.guild.id
+        player = self._player(ctx.guild.id)
 
         if player.twentyfourseven:
             player.twentyfourseven = False
@@ -435,6 +422,8 @@ class Music(commands.Cog):
                 channel=ctx.author.voice.channel, self_mute=False, self_deaf=True
             )
 
+        player = self._player(ctx.guild.id)
+
         loading_msg = await ctx.send("🔍 Searching...")
         track = await self._ydl.resolve(query)
 
@@ -444,8 +433,6 @@ class Music(commands.Cog):
             )
 
         await loading_msg.delete()
-
-        player = self._player(ctx.guild.id)
 
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
             player.queue.append(track)
